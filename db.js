@@ -1,94 +1,7 @@
-const sqlite3 = require('sqlite3').verbose();
-const db = new sqlite3.Database('steps.db');
-
-// Create tables
-db.serialize(() => {
-  db.run(`CREATE TABLE IF NOT EXISTS users (
-    user_id TEXT PRIMARY KEY
-  )`);
-
-  db.run(`CREATE TABLE IF NOT EXISTS user_steps (
-    user_id TEXT,
-    date TEXT,
-    steps INTEGER,
-    PRIMARY KEY(user_id, date)
-  )`);
-});
-
-// Add user on registration
-function registerUser(userId, callback) {
-  db.run(`INSERT OR IGNORE INTO users (user_id) VALUES (?)`, [userId], callback);
-}
-
-// Check if user is registered
-function isRegistered(userId, callback) {
-  db.get(`SELECT 1 FROM users WHERE user_id = ?`, [userId], (err, row) => {
-    if (err) return callback(err);
-    callback(null, !!row);
-  });
-}
-
-function logSteps(userId, dateStr, steps, callback) {
-  db.run(`
-    INSERT INTO user_steps (user_id, date, steps) VALUES (?, ?, ?)
-    ON CONFLICT(user_id, date) DO UPDATE SET steps = excluded.steps
-  `, [userId, dateStr, steps], callback);
-}
-
-function getUserStats(userId, callback) {
-  const today = new Date().toISOString().slice(0, 10);
-  const weekStart = new Date();
-  weekStart.setDate(weekStart.getDate() - ((weekStart.getDay() + 6) % 7));
-  const weekStartStr = weekStart.toISOString().slice(0, 10);
-  const monthStart = new Date(); monthStart.setDate(1);
-  const monthStartStr = monthStart.toISOString().slice(0, 10);
-
-  db.all(`
-    SELECT date, steps FROM user_steps WHERE user_id = ?
-  `, [userId], (err, rows) => {
-    if (err) return callback(err);
-    let daily = 0, weekly = 0, monthly = 0, total = 0, activeDays = rows.length;
-    rows.forEach(r => {
-      total += r.steps;
-      if (r.date === today) daily = r.steps;
-      if (r.date >= weekStartStr) weekly += r.steps;
-      if (r.date >= monthStartStr) monthly += r.steps;
-    });
-    const avgDaily = activeDays ? Math.round(total / activeDays) : 0;
-    callback(null, { daily, weekly, monthly, total, avgDaily, activeDays });
-  });
-}
-
-function getLeaderboard(period, callback) {
-  const sql = {
-    daily: `date = date('now')`,
-    weekly: `date >= date('now','weekday 1','-6 days')`,
-    monthly: `date >= date('now','start of month')`
-  }[period];
-
-  db.all(`
-    SELECT user_id, SUM(steps) AS sum_steps
-    FROM user_steps WHERE ${sql}
-    GROUP BY user_id
-    ORDER BY sum_steps DESC LIMIT 10
-  `, [], callback);
-}
-
-function resetSteps(userId, dateStr, callback) {
-  db.run(`
-    INSERT INTO user_steps (user_id, date, steps) VALUES (?, ?, 0)
-    ON CONFLICT(user_id, date) DO UPDATE SET steps = 0
-  `, [userId, dateStr], callback);
-}
-
-function deleteUser(userId, callback) {
-  db.serialize(() => {
-    db.run(`DELETE FROM user_steps WHERE user_id = ?`, [userId]);
-    db.run(`DELETE FROM users WHERE user_id = ?`, [userId], callback);
-  });
-}
-
-module.exports = {
+// bot.js
+require('dotenv').config();
+const TelegramBot = require('node-telegram-bot-api');
+const {
   registerUser,
   isRegistered,
   logSteps,
@@ -96,4 +9,206 @@ module.exports = {
   getLeaderboard,
   resetSteps,
   deleteUser
-};
+} = require('./db');
+
+const token = process.env.BOT_TOKEN;
+const bot = new TelegramBot(token, { polling: true });
+
+console.log('🤖 Telegram bot started and is polling for messages...');
+
+// /register
+bot.onText(/\/register/, (msg) => {
+  const userId = msg.from.id.toString();
+  const name = msg.from.first_name || 'User';
+
+  registerUser(userId, (err) => {
+    if (err) {
+      console.error(err);
+      bot.sendMessage(msg.chat.id, '❌ Failed to register.');
+    } else {
+      bot.sendMessage(msg.chat.id, `🎉 Welcome ${name}! You're now registered. Use /steps <number> to log your steps.`);
+    }
+  });
+});
+
+// /steps <number>
+bot.onText(/\/steps (\d+)/, (msg, match) => {
+  const steps = parseInt(match[1]);
+  const userId = msg.from.id.toString();
+  const date = new Date().toISOString().slice(0, 10);
+
+  isRegistered(userId, (err, registered) => {
+    if (err || !registered) {
+      bot.sendMessage(msg.chat.id, '❌ Please register first using /register.');
+      return;
+    }
+
+    logSteps(userId, date, steps, (err) => {
+      if (err) {
+        console.error(err);
+        bot.sendMessage(msg.chat.id, '❌ Error saving steps.');
+      } else {
+        bot.sendMessage(msg.chat.id, `✅ Logged ${steps} steps for today!`);
+      }
+    });
+  });
+});
+
+// /mystats
+bot.onText(/\/mystats/, (msg) => {
+  const userId = msg.from.id.toString();
+  const name = msg.from.first_name || 'User';
+
+  isRegistered(userId, (err, registered) => {
+    if (err || !registered) {
+      bot.sendMessage(msg.chat.id, '❌ Please register first using /register.');
+      return;
+    }
+
+    getUserStats(userId, (err, stats) => {
+      if (err) {
+        console.error(err);
+        bot.sendMessage(msg.chat.id, '❌ Could not retrieve your stats.');
+        return;
+      }
+
+      const message = `📊 *Your Stats - ${name}*\n\n` +
+        `👟 Today: ${stats.daily}\n` +
+        `📅 This Week: ${stats.weekly}\n` +
+        `📆 This Month: ${stats.monthly}\n` +
+        `🏆 Total Steps: ${stats.total}\n` +
+        `📈 Daily Avg: ${stats.avgDaily} steps`;
+
+      bot.sendMessage(msg.chat.id, message, { parse_mode: 'Markdown' });
+    });
+  });
+});
+
+// /reset - Reset today's steps to 0
+bot.onText(/\/reset/, (msg) => {
+  const userId = msg.from.id.toString();
+  const date = new Date().toISOString().slice(0, 10);
+
+  isRegistered(userId, (err, registered) => {
+    if (err || !registered) {
+      bot.sendMessage(msg.chat.id, '❌ Please register first using /register.');
+      return;
+    }
+
+    resetSteps(userId, date, (err) => {
+      if (err) {
+        console.error(err);
+        bot.sendMessage(msg.chat.id, '❌ Could not reset steps.');
+      } else {
+        bot.sendMessage(msg.chat.id, '🔄 Your steps for today have been reset to 0.');
+      }
+    });
+  });
+});
+
+// /delete - Delete user from DB
+bot.onText(/\/delete/, (msg) => {
+  const userId = msg.from.id.toString();
+
+  isRegistered(userId, (err, registered) => {
+    if (err || !registered) {
+      bot.sendMessage(msg.chat.id, '❌ You are not registered.');
+      return;
+    }
+
+    deleteUser(userId, (err) => {
+      if (err) {
+        console.error(err);
+        bot.sendMessage(msg.chat.id, '❌ Failed to delete your data.');
+      } else {
+        bot.sendMessage(msg.chat.id, '🗑️ You have been removed from the challenge. Use /register to join again.');
+      }
+    });
+  });
+});
+
+// /daily leaderboard
+bot.onText(/\/daily/, (msg) => {
+  getLeaderboard('daily', (err, rows) => {
+    if (err) {
+      console.error(err);
+      bot.sendMessage(msg.chat.id, '❌ Failed to fetch leaderboard.');
+      return;
+    }
+
+    let text = `🏆 *DAILY LEADERBOARD*\n\n`;
+    if (rows.length === 0) {
+      text += 'No data yet!';
+    } else {
+      rows.forEach((row, i) => {
+        const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : '🏃';
+        text += `${medal} *${i + 1}.* User ${row.user_id} - ${row.sum_steps} steps\n`;
+      });
+    }
+
+    bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
+  });
+});
+
+// /weekly leaderboard
+bot.onText(/\/weekly/, (msg) => {
+  getLeaderboard('weekly', (err, rows) => {
+    if (err) {
+      console.error(err);
+      bot.sendMessage(msg.chat.id, '❌ Failed to fetch leaderboard.');
+      return;
+    }
+
+    let text = `🏆 *WEEKLY LEADERBOARD*\n\n`;
+    if (rows.length === 0) {
+      text += 'No data yet!';
+    } else {
+      rows.forEach((row, i) => {
+        const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : '🏃';
+        text += `${medal} *${i + 1}.* User ${row.user_id} - ${row.sum_steps} steps\n`;
+      });
+    }
+
+    bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
+  });
+});
+
+// /monthly leaderboard
+bot.onText(/\/monthly/, (msg) => {
+  getLeaderboard('monthly', (err, rows) => {
+    if (err) {
+      console.error(err);
+      bot.sendMessage(msg.chat.id, '❌ Failed to fetch leaderboard.');
+      return;
+    }
+
+    let text = `🏆 *MONTHLY LEADERBOARD*\n\n`;
+    if (rows.length === 0) {
+      text += 'No data yet!';
+    } else {
+      rows.forEach((row, i) => {
+        const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : '🏃';
+        text += `${medal} *${i + 1}.* User ${row.user_id} - ${row.sum_steps} steps\n`;
+      });
+    }
+
+    bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
+  });
+});
+
+// /help
+bot.onText(/\/help/, (msg) => {
+  const helpText = `🤖 *FAMILY STEPS TRACKER BOT* 🤖\n\n` +
+    `*Commands:*\n` +
+    `/register - Join the challenge\n` +
+    `/steps <number> - Log your steps\n` +
+    `/mystats - View your stats\n` +
+    `/reset - Reset today's steps\n` +
+    `/delete - Remove your account\n` +
+    `/daily - Daily leaderboard\n` +
+    `/weekly - Weekly leaderboard\n` +
+    `/monthly - Monthly leaderboard\n` +
+    `/help - Show this help message`;
+
+  bot.sendMessage(msg.chat.id, helpText, { parse_mode: 'Markdown' });
+});
